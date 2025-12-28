@@ -1,4 +1,5 @@
 import warnings
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, List, Optional, Tuple
@@ -312,14 +313,14 @@ class MambaAttentionMixer(nn.Module):
         self.inner_attn = Attention(flash)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.ffn = nn.Sequential(
-            nn.Linear(4 * embed_dim, 2 * embed_dim),
+            nn.Linear(3 * embed_dim, 2 * embed_dim),
             nn.LayerNorm(2 * embed_dim, elementwise_affine=True),
             nn.GELU(),
             nn.Linear(2 * embed_dim, embed_dim),
         )
 
-        # Mamba
-        self.mamba_mixer = MambaMixer(self.embed_dim)
+        # VSSBlock replacement for the SSM mixer
+        self.vss_block = VSSBlock(hidden_dim=self.embed_dim)
 
     def forward(
         self,
@@ -335,10 +336,10 @@ class MambaAttentionMixer(nn.Module):
         context = self.inner_attn(q, k, v, mask=mask)
         message = self.out_proj(context.transpose(1, 2).flatten(start_dim=-2))
 
-        # Mamba
-        mamba_y, mamba_z = self.mamba_mixer(x)
+        # VSSBlock
+        vss_out = self.vss_block(x)
 
-        return x + self.ffn(torch.cat([x, message, mamba_y, mamba_z], -1))
+        return x + self.ffn(torch.cat([x, message, vss_out], -1))
 
 
 class CrossBlock(nn.Module):
@@ -857,3 +858,151 @@ class MambaGlue(nn.Module):
             return self.pruning_keypoint_thresholds["flash"]
         else:
             return self.pruning_keypoint_thresholds[device.type]
+
+
+class DropPath(nn.Module):
+    """Stochastic depth regularization."""
+
+    def __init__(self, drop_prob: float = 0.0) -> None:
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x.div(keep_prob) * random_tensor
+
+
+class SpatialSelfAttention(nn.Module):
+    """Lightweight spatial mixer used inside VSSBlock."""
+
+    def __init__(
+        self, d_model: int, d_state: int = 16, expand: float = 2.0, dropout: float = 0.0
+    ) -> None:
+        super().__init__()
+        inner_dim = int(d_model * expand)
+        self.block = nn.Sequential(
+            nn.Conv2d(d_model, d_model, kernel_size=3, padding=1, groups=d_model),
+            nn.Conv2d(d_model, inner_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(inner_dim, d_model, kernel_size=1),
+            nn.Dropout2d(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 3, 1, 2).contiguous()
+        x = self.block(x)
+        return x.permute(0, 2, 3, 1).contiguous()
+
+
+class CAB(nn.Module):
+    """Simple convolutional attention block used as an enhancer in VSSBlock."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.body(x)
+
+
+class VSSBlock(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int = 0,
+        drop_path: float = 0,
+        norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+        attn_drop_rate: float = 0,
+        d_state: int = 16,
+        expand: float = 2.0,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        self.ln_1 = norm_layer(hidden_dim)
+        self.self_attention = SpatialSelfAttention(
+            d_model=hidden_dim, d_state=d_state, expand=expand, dropout=attn_drop_rate
+        )
+        self.drop_path = DropPath(drop_path)
+        self.skip_scale = nn.Parameter(torch.ones(hidden_dim))
+
+        self.ln_11 = norm_layer(hidden_dim)
+        self.self_attention1 = SpatialSelfAttention(
+            d_model=hidden_dim, d_state=d_state, expand=expand, dropout=attn_drop_rate
+        )
+        self.drop_path1 = DropPath(drop_path)
+        self.skip_scale1 = nn.Parameter(torch.ones(hidden_dim))
+
+        self.conv_blk = CAB(hidden_dim)
+        self.ln_2 = nn.LayerNorm(hidden_dim)
+        self.skip_scale2 = nn.Parameter(torch.ones(hidden_dim))
+
+        self.block = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, 1, 1, 0),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(hidden_dim, hidden_dim, 1, 1, 0),
+            nn.LeakyReLU(0.1, inplace=True),
+        )
+
+        self.linear_out = nn.Linear(hidden_dim * 3, hidden_dim)
+
+    def _infer_hw(self, length: int, x_size: Optional[Tuple[int, int]] = None) -> Tuple[int, int]:
+        if x_size is not None:
+            return x_size
+        h = int(math.sqrt(length))
+        h = max(h, 1)
+        w = math.ceil(length / h)
+        return h, w
+
+    def forward(self, input: torch.Tensor, x_size: Optional[Tuple[int, int]] = None):
+        B, L, C = input.shape
+        h, w = self._infer_hw(L, x_size)
+        total = h * w
+        if total != L:
+            pad = torch.zeros((B, total - L, C), device=input.device, dtype=input.dtype)
+            input = torch.cat([input, pad], dim=1)
+
+        x_hw = input.view(B, h, w, C).contiguous()
+        prepare = rearrange(x_hw, "b h w c -> b c h w")
+
+        pooled = F.avg_pool2d(prepare, kernel_size=2, stride=2, ceil_mode=True)
+
+        h11 = self.ln_11(x_hw)
+        h11 = x_hw * self.skip_scale1 + self.drop_path1(self.self_attention1(h11))
+        h11 = rearrange(h11, "b h w c -> b c h w")
+        h11 = self.conv_blk(h11)
+        recons2 = rearrange(h11, "b c h w -> b h w c")
+
+        x = self.ln_1(x_hw)
+        x = x_hw * self.skip_scale + self.drop_path(self.self_attention(x))
+
+        input_freq = torch.fft.rfft2(prepare) + 1e-8
+        mag = torch.abs(input_freq)
+        pha = torch.angle(input_freq)
+        mag = self.block(mag)
+        real = mag * torch.cos(pha)
+        imag = mag * torch.sin(pha)
+        x_out = torch.complex(real, imag) + 1e-8
+        x_out = torch.fft.irfft2(x_out, s=(h, w), norm="backward") + 1e-8
+        x_out = torch.abs(x_out) + 1e-8
+        x_out = rearrange(x_out, "b c h w -> b h w c")
+
+        x_seq = x.view(B, -1, C)
+        x_out_seq = x_out.view(B, -1, C)
+        x_dwt_seq = recons2.view(B, -1, C)
+
+        if total != L:
+            x_seq = x_seq[:, :L, :]
+            x_out_seq = x_out_seq[:, :L, :]
+            x_dwt_seq = x_dwt_seq[:, :L, :]
+
+        x_final = torch.cat((x_seq, x_out_seq, x_dwt_seq), dim=2)
+        x_final = self.linear_out(x_final)
+        return x_final
